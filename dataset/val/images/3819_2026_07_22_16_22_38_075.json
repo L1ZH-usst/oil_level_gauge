@@ -1,0 +1,41 @@
+{
+  "version": "4.0.0-beta.13",
+  "flags": {},
+  "checked": false,
+  "shapes": [
+    {
+      "label": "oil_level_gauge",
+      "score": null,
+      "points": [
+        [
+          661.3170731707318,
+          104.68292682926833
+        ],
+        [
+          1141.8048780487804,
+          104.68292682926833
+        ],
+        [
+          1141.8048780487804,
+          1018.0975609756098
+        ],
+        [
+          661.3170731707318,
+          1018.0975609756098
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "difficult": false,
+      "shape_type": "rectangle",
+      "flags": {},
+      "attributes": {},
+      "kie_linking": []
+    }
+  ],
+  "imagePath": "3819_2026_07_22_16_22_38_075.jpg",
+  "imageData": null,
+  "imageHeight": 1024,
+  "imageWidth": 1408,
+  "description": ""
+}

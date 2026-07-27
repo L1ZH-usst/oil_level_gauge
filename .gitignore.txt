@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# venv
+.venv/
+venv/
+
+# IDEA
+.idea/
+
+# VSCode
+.vscode/
+
+# dataset
+dataset/
+data/
+
+# ultralytics
+runs/
+
+# weight
+*.pt
+*.onnx
+*.engine
+
+# logs
+wandb/
+
+# cache
+.cache/
+
+# images
+*.tmp
