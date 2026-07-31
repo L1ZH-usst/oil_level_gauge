@@ -99,7 +99,7 @@ class OilLevelGaugeDetector:
               - tube_bounds:      液柱管体边界 [x1, y1, x2, y2]（绝对坐标）
               - reference_lines_y: 两条红线的 y 坐标列表（绝对坐标）
               - oil_level_y:      油面 y 坐标（绝对坐标）
-              - oil_level_position_ratio: 油面在红线区间内的相对位置 (0~1)
+              - oil_level_position_ratio: 油面在液柱管体内的相对位置 (0~1)
               - oil_level_score:  油面检测梯度得分
               - result_image:     标注了检测结果的可视化图片
               - image_width/height: 原图尺寸
@@ -181,9 +181,10 @@ class OilLevelGaugeDetector:
         check_result = "NORMAL" if is_normal else "ABNORMAL"
         reason = "oil_level_between_red_lines" if is_normal else "oil_level_outside_red_lines"
 
-        # 油面在红线区间内的相对位置：0=紧贴上红线，1=紧贴下红线
-        # 用于工程排障和可视化，值可以 <0 或 >1（异常情况）
-        position_ratio = (oil_y - upper_y) / max(lower_y - upper_y, 1)
+        # 新：基于管体顶部/底部计算
+        tube_top = tube["top"]
+        tube_bottom = tube["bottom"]
+        position_ratio = (oil_y - tube_top) / max(tube_bottom - tube_top, 1)
 
         # 生成带标注的可视化结果图
         result_image = _draw_structure_result(image, bbox_xyxy, gauge["confidence"], tube, lines, level, state)
@@ -469,132 +470,193 @@ def _find_tube_bounds(roi: np.ndarray, options: dict[str, Any]) -> dict[str, int
 #  第二段步骤二：红色参考线识别（仅管体左边界左侧区域）
 # ===========================================================================
 
-def _find_reference_lines(roi: np.ndarray, tube: dict[str, int], options: dict[str, Any]) -> list[dict[str, Any]]:
+def _is_overexposed(roi: np.ndarray, threshold: float = 0.22, highlight_val: int = 220) -> bool:
     """
-    在油位表 ROI 中识别上下两条红色参考线。
+    判断 ROI 区域是否属于严重曝光过度。
 
-    【修改说明】红线搜索区域从"管体左右壁附近"改为"管体左边界左侧区域"。
-    即只在 ROI 中 x < tube["left"] 的区域内搜索红色连通域。
-
-    算法原理：
-      油位表管体的左侧各有一条红色标记线，用于标示正常油位的上下限。
-      通过 HSV 色彩空间的红色阈值分割，在管体左边界以左的区域提取红色区域，
-      再用连通域分析筛选出符合条件（面积、宽度、宽高比）的红色连通域。
-      最终取最上方和最下方的两条红线。
-
-    红色在 HSV 空间中分布特殊（H 通道在 0° 附近和 180° 附近各有一段），
-    因此需要分别提取两段再合并：
-      - 低 H 段：H ∈ [0, 12]
-      - 高 H 段：H ∈ [160, 179]
+    原理：
+        1. 计算灰度图中高亮像素（亮度 >= 220）在整张图中的占比。
+        2. 如果高亮像素比例超过设定阈值（默认 22%），则判定为严重曝光。
 
     参数:
-        roi:     油位表区域的小图
-        tube:    管体边界 {"left", "right", "top", "bottom"}
-        options: 算法参数
-            - red_hue_low_min/max:   低 H 段范围（默认 0~12）
-            - red_hue_high_min/max:  高 H 段范围（默认 160~179）
-            - red_saturation_min:    最小饱和度（默认 80）
-            - red_value_min:         最小明度（默认 80）
-            - red_min_area_ratio:    最小面积比例（默认 0.0005）
-            - red_min_width_ratio:   最小宽度比例（默认 0.08）
-            - red_min_aspect_ratio:  最小宽高比（默认 1.2，即红线必须是横向的）
-            - red_side_band_ratio:   管体左边界附近的容差带比例（默认 0.18）
-            - red_line_min_gap_ratio:两条红线之间的最小间距比例（默认 0.08）
-
-    返回:
-        排序后的红线列表（按 y 坐标升序），每个元素：
-        {"bbox": [x,y,w,h], "center_x": float, "center_y": float, "area": int, "aspect": float}
-        通常返回 2 个元素（上红线、下红线），不足时返回空列表。
+        roi: 输入的 BGR 图片
+        threshold: 高亮像素占比阈值，默认 0.22 (22%)
+        highlight_val: 认定为高亮的像素亮度门槛，默认 220
     """
-    # 步骤 1：RGB → HSV，提取红色掩膜
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    highlight_pixels = np.sum(gray >= highlight_val)
+    total_pixels = gray.size
+    ratio = highlight_pixels / total_pixels
+    return ratio > threshold
 
-    # 红色低 H 段（H: 0~12, S≥80, V≥80）
-    mask_low = cv2.inRange(
-        hsv,
-        np.array([int(options.get("red_hue_low_min", 0)),
-                  int(options.get("red_saturation_min", 80)),
-                  int(options.get("red_value_min", 80))]),
-        np.array([int(options.get("red_hue_low_max", 12)), 255, 255]),
-    )
-    # 红色高 H 段（H: 160~179, S≥80, V≥80）
-    mask_high = cv2.inRange(
-        hsv,
-        np.array([int(options.get("red_hue_high_min", 160)),
-                  int(options.get("red_saturation_min", 80)),
-                  int(options.get("red_value_min", 80))]),
-        np.array([int(options.get("red_hue_high_max", 179)), 255, 255]),
-    )
-    # 合并两段红色掩膜
-    mask = cv2.bitwise_or(mask_low, mask_high)
 
-    # 步骤 2：形态学闭运算，填补红色区域中的小空洞
-    # 核为 3x9 的矩形，水平方向更长，适合填充横向的红线
-    kernel = np.ones((3, 9), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+def _find_reference_lines(
+    roi: np.ndarray,
+    tube: dict[str, int],
+    options: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """
+    工业油位表红色参考线检测（带曝光判断的双分支版本）
 
-    # 步骤 3：连通域分析，找出所有独立的红色区域
-    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    candidates: list[dict[str, Any]] = []
+    逻辑：
+        检测 ROI 的曝光程度：
+        - 曝光严重 (True)  -> 运行增强版算法（CLAHE + RGB差值 + 粗内核膨胀）
+        - 光照正常 (False) -> 运行原版算法（低开销 + 标准 HSV 色彩分割）
+    """
     roi_h, roi_w = roi.shape[:2]
 
-    # 筛选阈值
-    min_area = int(max(60, roi_h * roi_w * float(options.get("red_min_area_ratio", 0.0005))))
-    min_width = roi_w * float(options.get("red_min_width_ratio", 0.08))
-    min_aspect = float(options.get("red_min_aspect_ratio", 1.2))
-    side_margin = int(roi_w * float(options.get("red_side_band_ratio", 0.18)))
+    # ==========================================================
+    # 0. 曝光程度自动判定
+    # ==========================================================
+    is_overexposed = _is_overexposed(
+        roi,
+        threshold=float(options.get("overexposure_threshold", 0.22)),
+        highlight_val=int(options.get("overexposure_highlight_val", 220))
+    )
 
-    for label in range(1, count):  # label 0 是背景，跳过
-        x, y, w, h, area = stats[label]
+    # ----------------------------------------------------------
+    # 分支一：光照正常（原版高效算法）
+    # ----------------------------------------------------------
+    if not is_overexposed:
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # 正常光照下的 HSV 容忍范围
+        sat_min = int(options.get("red_saturation_min_normal", 80))
+        val_min = int(options.get("red_value_min_normal", 80))
+
+        mask_low = cv2.inRange(
+            hsv,
+            np.array([int(options.get("red_hue_low_min", 0)), sat_min, val_min]),
+            np.array([int(options.get("red_hue_low_max", 12)), 255, 255]),
+        )
+        mask_high = cv2.inRange(
+            hsv,
+            np.array([int(options.get("red_hue_high_min", 160)), sat_min, val_min]),
+            np.array([int(options.get("red_hue_high_max", 179)), 255, 255]),
+        )
+        mask = cv2.bitwise_or(mask_low, mask_high)
+
+        # 原版精细形态学闭运算
+        kernel = np.ones((3, 9), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # ----------------------------------------------------------
+    # 分支二：严重曝光（增强版算法）
+    # ----------------------------------------------------------
+    else:
+        # 1. 光照增强 CLAHE
+        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        enhanced = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+        # 2. HSV 红色检测（强光降阈值）
+        hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+        sat_min = int(options.get("red_saturation_min", 35))
+        val_min = int(options.get("red_value_min", 50))
+
+        mask_hsv1 = cv2.inRange(hsv, np.array([0, sat_min, val_min]), np.array([12, 255, 255]))
+        mask_hsv2 = cv2.inRange(hsv, np.array([160, sat_min, val_min]), np.array([179, 255, 255]))
+        hsv_mask = cv2.bitwise_or(mask_hsv1, mask_hsv2)
+
+        # 3. RGB 红色差增强
+        b_channel, g_channel, r_channel = cv2.split(enhanced)
+        red_score = r_channel.astype(np.int16) - (g_channel.astype(np.int16) + b_channel.astype(np.int16)) / 2
+        rgb_mask = np.zeros_like(r_channel)
+        rgb_mask[red_score > 20] = 255
+
+        # 4. 融合 HSV + RGB
+        mask = cv2.bitwise_or(hsv_mask, rgb_mask)
+
+        # 5. 横向扩展形态学抗断裂
+        kernel = np.ones((5, 25), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        kernel2 = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel2)
+
+
+    # ==========================================================
+    # 公共步骤：掩膜区域限制（仅保留管体左侧）
+    # ==========================================================
+    tube_left = tube["left"]
+    side_margin = int(roi_w * float(options.get("red_side_band_ratio", 0.25)))
+    x_limit = min(roi_w, tube_left + side_margin)
+
+    roi_mask = np.zeros_like(mask)
+    roi_mask[:, :x_limit] = 255
+    mask = cv2.bitwise_and(mask, roi_mask)
+
+
+    # ==========================================================
+    # 公共步骤：连通域分析 + 几何筛选 + 评分去重
+    # ==========================================================
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    candidates = []
+
+    min_area = int(roi_h * roi_w * float(options.get("red_min_area_ratio", 0.0003)))
+    min_width = roi_w * float(options.get("red_min_width_ratio", 0.05))
+
+    # 之前讨论过的垂直范围限制（如需限制在 15%~50% 范围可从 options 取参，默认 0~1.0 全高）
+    min_y_ratio = float(options.get("red_min_y_ratio", 0.10))
+    max_y_ratio = float(options.get("red_max_y_ratio", 0.50))
+
+    for i in range(1, count):
+        x, y, w, h, area = stats[i]
+
         if area < min_area or w < min_width:
-            continue  # 面积或宽度不够，跳过
-        aspect = w / max(h, 1)
-        if aspect < min_aspect:
-            continue  # 不够"横向"，红线应该是扁长的，跳过
+            continue
 
-        # 【修改】仅在管体左边界左侧区域搜索红色参考线
-        # 条件：红色连通域的右边缘在管体左边界左侧（允许少量容差越过管壁）
+        aspect = w / max(h, 1)
+        if aspect < 2.0:  # 红线必须明显横向
+            continue
+
         center_x = x + w / 2.0
         center_y = y + h / 2.0
 
-        # 红色区域右边缘不能超过管体左边界 + side_margin
-        if (x + w) > tube["left"] + side_margin:
-            continue  # 延伸到管体内部或右侧，不是左侧参考线
+        # Y 轴区间过滤
+        if not (roi_h * min_y_ratio <= center_y <= roi_h * max_y_ratio):
+            continue
 
-        # 红色区域左边缘不能太靠近 ROI 左边界（避免边界伪影）
+        # 排除左贴边
         if x < 2:
             continue
 
-        candidates.append(
-            {
-                "bbox": [int(x), int(y), int(w), int(h)],
-                "center_x": float(center_x),
-                "center_y": float(center_y),
-                "area": int(area),
-                "aspect": float(aspect),
-            }
-        )
+        # 排除过度侵入管体内部的区域
+        if x + w > tube_left + side_margin:
+            continue
+
+        candidates.append({
+            "bbox": [int(x), int(y), int(w), int(h)],
+            "center_x": float(center_x),
+            "center_y": float(center_y),
+            "area": int(area),
+            "aspect": float(aspect),
+            "score": float(area) * 0.5 + float(aspect) * 20.0
+        })
 
     if len(candidates) < 2:
-        return []  # 候选红线不足两条
-
-    # 步骤 4：去重——按面积和宽高比降序排列，保留面积大且间距足够的
-    candidates.sort(key=lambda item: (item["area"], item["aspect"]), reverse=True)
-    deduped: list[dict[str, Any]] = []
-    min_gap = roi_h * float(options.get("red_line_min_gap_ratio", 0.08))
-    for item in candidates:
-        # 与已保留的红线比较，间距不够则视为同一位置的重复，跳过
-        if all(abs(item["center_y"] - exist["center_y"]) >= min_gap for exist in deduped):
-            deduped.append(item)
-        if len(deduped) >= 6:
-            break  # 最多保留 6 条候选，足够了
-
-    if len(deduped) < 2:
         return []
 
-    # 步骤 5：按 y 坐标排序，取最上方和最下方的两条
-    deduped.sort(key=lambda item: item["center_y"])
-    return [deduped[0], deduped[-1]]
+    # 按综合评分降序排列
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+
+    # Y 轴方向去重（防止同条线被重复提取）
+    selected = []
+    min_gap = roi_h * float(options.get("red_line_min_gap_ratio", 0.08))
+
+    for item in candidates:
+        if all(abs(item["center_y"] - s["center_y"]) > min_gap for s in selected):
+            selected.append(item)
+        if len(selected) >= 6:
+            break
+
+    if len(selected) < 2:
+        return []
+
+    # 按中心 Y 轴升序排列，选取最上和最下的两条红线
+    selected.sort(key=lambda item: item["center_y"])
+    return [selected[0], selected[-1]]
 
 
 # ===========================================================================
@@ -666,9 +728,12 @@ def _find_oil_level(
     if grad.size == 0:
         return None
 
-    # 在整个管体高度范围内搜索油面位置
-    search_top = 0
-    search_bottom = len(grad) - 1
+    # 在管体下 72% 范围内搜索油面（舍弃上 28%）
+    # 设置油面搜索范围：跳过上 28% 和下 30%（即仅在中间 28% ~ 70% 区域内搜索）
+    total_len = len(grad)
+    search_top = int(total_len * 0.28)  # 跳过顶部 28%
+    search_bottom = int(total_len * 0.70) - 1  # 跳过底部 30%（取上限为 70%）
+
     if search_bottom <= search_top:
         return None
 

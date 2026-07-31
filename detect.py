@@ -3,7 +3,7 @@
 
 用法：
   # 检测单张图片
-  python detect.py --image dataset/val/images/3809_2026_07_22_16_22_26_865.jpg
+  python detect.py --image C:/Users/elitedatai/Desktop/datasets/images/5146_2026_07_22_16_39_30_312.jpg
 
   # 批量检测整个文件夹
   python detect.py --image dataset/val/images/
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--image", type=str, required=True,
                         help="待检测图片路径或文件夹路径")
-    parser.add_argument("--model", type=str, default=r"C:\Users\elitedatai\Desktop\油位表识别\runs\detect\runs\train\oil_level_gauge\weights\best.pt",
+    parser.add_argument("--model", type=str, default=r"C:\Users\elitedatai\Desktop\油位表识别\best.pt",
                         help="YOLO 模型权重文件路径（默认: weights/best.pt）")
     parser.add_argument("--output", type=str, default="results",
                         help="结果图片输出目录（默认: results/）")
@@ -100,7 +100,8 @@ def print_result(filepath: str, result: dict) -> None:
         score = result.get("oil_level_score", 0)
         tube = result.get("tube_bounds", [])
         lines_y = result.get("reference_lines_y", [])
-        print(f"           oil_y={oil_y}  ratio={ratio}  score={score:.2f}")
+        overexposed = result.get("is_overexposed", [])
+        print(f"           oil_y={oil_y}  ratio={ratio}  score={score:.2f}  曝光={overexposed}")
         if tube:
             print(f"           tube_bounds={tube}")
         if lines_y:
