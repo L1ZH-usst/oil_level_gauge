@@ -52,8 +52,10 @@ class OilLevelGaugeDetector:
         """
         self.model_path = str(model_path)
         self.defaults = defaults or {}
-        self._model: YOLO | None = None  # YOLO 模型实例（延迟加载）
-        self._loaded = False              # 模型是否已加载的标志
+        self._model: YOLO | None = None       # 油位表 YOLO 模型实例（延迟加载）
+        self._loaded = False                   # 油位表模型是否已加载
+        self._redline_model: YOLO | None = None  # 红线检测 YOLO 模型实例（延迟加载）
+        self._redline_loaded = False           # 红线模型是否已加载
 
     @property
     def loaded(self) -> bool:
@@ -70,6 +72,18 @@ class OilLevelGaugeDetector:
             raise RuntimeError(f"油位表模型不存在: {self.model_path}")
         self._model = YOLO(self.model_path)
         self._loaded = True
+
+    def load_redline_model(self, redline_model_path: str | Path) -> None:
+        """
+        加载红线检测 YOLO 模型权重到内存（可选，不调用则使用传统方法检测红线）。
+
+        如果权重文件不存在会抛出 RuntimeError。
+        """
+        redline_model_path = str(redline_model_path)
+        if not Path(redline_model_path).exists():
+            raise RuntimeError(f"红线检测模型不存在: {redline_model_path}")
+        self._redline_model = YOLO(redline_model_path)
+        self._redline_loaded = True
 
     def infer(self, image: Any, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """
@@ -121,6 +135,7 @@ class OilLevelGaugeDetector:
                 image=image,
                 reason="oil_level_gauge_not_detected",
                 cost_ms=int((time.time() - t0) * 1000),
+                roi=image,  # 没有 ROI，用原图做曝光判断
             )
 
         # 裁剪检测框区域，得到 ROI（感兴趣区域）
@@ -138,10 +153,24 @@ class OilLevelGaugeDetector:
                 cost_ms=int((time.time() - t0) * 1000),
                 confidence=gauge["confidence"],
                 gauge_bbox=bbox_xywh,
+                roi=roi,
             )
 
-        # === 第二段第二步：在管体左边界左侧区域识别两条红色参考线 ===
-        lines = _find_reference_lines(roi, tube, options)
+        # === 第二段第二步：识别两条红色参考线（YOLO 优先，传统方法 fallback）===
+        redline_method = "traditional"
+
+        if self._redline_loaded and self._redline_model is not None:
+            # 优先使用 YOLO 红线检测模型
+            lines = _detect_redlines_with_yolo(self._redline_model, roi, options)
+            if len(lines) >= 2:
+                redline_method = "yolo"
+            else:
+                # YOLO 检测不足，fallback 到传统方法
+                lines = _find_reference_lines(roi, tube, options)
+        else:
+            # 未加载红线模型，使用传统方法
+            lines = _find_reference_lines(roi, tube, options)
+
         if len(lines) < 2:
             # 找不到足够的红色参考线（至少需要上下两条）
             return _unknown_result(
@@ -151,6 +180,7 @@ class OilLevelGaugeDetector:
                 confidence=gauge["confidence"],
                 gauge_bbox=bbox_xywh,
                 tube_bounds=_abs_tube_bounds(tube, bbox_xyxy),
+                roi=roi,
             )
 
         # lines[0] 是上方红线（y 较小），lines[1] 是下方红线（y 较大）
@@ -168,6 +198,7 @@ class OilLevelGaugeDetector:
                 gauge_bbox=bbox_xywh,
                 tube_bounds=_abs_tube_bounds(tube, bbox_xyxy),
                 reference_lines_y=_abs_line_positions(lines, bbox_xyxy),
+                roi=roi,
             )
 
         # === 状态判定 ===
@@ -222,6 +253,13 @@ class OilLevelGaugeDetector:
             "result_image": result_image,
             "image_width": image.shape[1],
             "image_height": image.shape[0],
+            "is_overexposed": _is_overexposed(
+                roi,
+                threshold=float(options.get("overexposure_threshold", 0.22)),
+                highlight_val=int(options.get("overexposure_highlight_val", 220)),
+            ),
+            "color_tint": _diagnose_color_tint(roi),
+            "redline_method": redline_method,
         }
 
 
@@ -237,6 +275,7 @@ def _unknown_result(
     gauge_bbox: list[int] | None = None,
     tube_bounds: list[int] | None = None,
     reference_lines_y: list[int] | None = None,
+    roi: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """
     构建 UNKNOWN 状态的返回结果。
@@ -252,7 +291,12 @@ def _unknown_result(
         gauge_bbox:        油位表检测框（如果有）
         tube_bounds:       管体边界（如果有）
         reference_lines_y: 红线位置（如果有）
+        roi:               检测框裁剪区域（如果有），用于曝光判断；没有时用 image
     """
+    # 用 ROI 判断曝光（如果有的话），否则回退到用原图
+    overexposed_img = roi if roi is not None else image
+    is_overexposed = _is_overexposed(overexposed_img, 0.22, 220)
+
     return {
         "cost_ms": cost_ms,
         "detections": [
@@ -285,6 +329,8 @@ def _unknown_result(
         "result_image": _draw_unknown_banner(image, reason),
         "image_width": image.shape[1],
         "image_height": image.shape[0],
+        "is_overexposed": is_overexposed,
+        "color_tint": _diagnose_color_tint(overexposed_img),
     }
 
 
@@ -490,18 +536,285 @@ def _is_overexposed(roi: np.ndarray, threshold: float = 0.22, highlight_val: int
     return ratio > threshold
 
 
+def _diagnose_color_tint(roi: np.ndarray) -> str:
+    """
+    判断图像的偏色方向。
+
+    返回:
+        "blue": 偏蓝/冷光
+        "yellow": 偏黄/暖光
+        "normal": 色温基本正常
+    """
+    roi_float = roi.astype(np.float32)
+    avg_b = np.mean(roi_float[:, :, 0])
+    avg_g = np.mean(roi_float[:, :, 1])
+    avg_r = np.mean(roi_float[:, :, 2])
+
+    # 方式：通过 R 与 B 的相对比例判断色温偏移
+    b_r_ratio = avg_b / (avg_r + 1e-5)
+    r_b_ratio = avg_r / (avg_b + 1e-5)
+
+    if b_r_ratio > 1.25:  # 蓝色显著高于红色
+        return "blue"
+    elif r_b_ratio > 1.03:  # 红色/黄色显著高于蓝色
+        return "yellow"
+    else:
+        return "normal"
+
+
+def _find_reference_lines_enhanced(
+        roi: np.ndarray,
+        options: dict[str, Any],
+) -> np.ndarray:
+    """
+    增强版红线检测掩膜生成（带偏色自动诊断与定向补偿机制）
+    """
+    # ==========================================================
+    # 1. 偏色方向诊断 (Blue / Yellow / Normal)
+    # ==========================================================
+    tint_type = _diagnose_color_tint(roi)
+
+    # ==========================================================
+    # 2. 根据偏色类型应用“定向”白平衡与颜色补偿
+    # ==========================================================
+    roi_float = roi.astype(np.float32)
+    avg_b = np.mean(roi_float[:, :, 0])
+    avg_g = np.mean(roi_float[:, :, 1])
+    avg_r = np.mean(roi_float[:, :, 2])
+    avg_gray = (avg_b + avg_g + avg_r) / 3.0 + 1e-5
+
+    roi_wb = roi_float.copy()
+
+    if tint_type == "blue":
+        # 常规全局白平衡
+        roi_wb[:, :, 0] = np.clip(roi_float[:, :, 0] * (avg_gray / (avg_b + 1e-5)), 0, 255)
+        roi_wb[:, :, 1] = np.clip(roi_float[:, :, 1] * (avg_gray / (avg_g + 1e-5)), 0, 255)
+        roi_wb[:, :, 2] = np.clip(roi_float[:, :, 2] * (avg_gray / (avg_r + 1e-5)), 0, 255)
+
+    elif tint_type == "yellow":
+        # 【暖色/偏黄定向校正】：重点拉高 B 通道，压低过度饱和的 R/G 通道
+        roi_wb[:, :, 0] = np.clip(roi_float[:, :, 0] * (avg_gray / (avg_b + 1e-5)) * 1.20, 0, 255)
+        roi_wb[:, :, 1] = np.clip(roi_float[:, :, 1] * (avg_gray / (avg_g + 1e-5)) * 0.90, 0, 255)
+        roi_wb[:, :, 2] = np.clip(roi_float[:, :, 2] * (avg_gray / (avg_r + 1e-5)) * 0.90, 0, 255)
+
+    else:
+        # 常规全局白平衡
+        roi_wb[:, :, 0] = np.clip(roi_float[:, :, 0] * (avg_gray / (avg_b + 1e-5)), 0, 255)
+        roi_wb[:, :, 1] = np.clip(roi_float[:, :, 1] * (avg_gray / (avg_g + 1e-5)), 0, 255)
+        roi_wb[:, :, 2] = np.clip(roi_float[:, :, 2] * (avg_gray / (avg_r + 1e-5)), 0, 255)
+
+    roi_balanced = roi_wb.astype(np.uint8)
+
+    # ==========================================================
+    # 3. Gamma 曝光补偿 + CLAHE 增强
+    # ==========================================================
+    gamma = float(options.get("red_gamma", 0.7))
+    table = np.array([((i / 255.0) ** gamma) * 255 for i in np.arange(256)]).astype("uint8")
+    roi_gamma = cv2.LUT(roi_balanced, table)
+
+    lab = cv2.cvtColor(roi_gamma, cv2.COLOR_BGR2LAB)
+    l, a, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    enhanced = cv2.cvtColor(cv2.merge([l, a, b_channel]), cv2.COLOR_LAB2BGR)
+
+    # ==========================================================
+    # 4. 定向 HSV 与 颜色显著性掩膜提取
+    # ==========================================================
+    hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+    b_ch, g_ch, r_ch = cv2.split(enhanced)
+
+    sat_min = int(options.get("red_saturation_min", 25))
+    val_min = int(options.get("red_value_min", 40))
+
+    # 基础红色区间 (H: 0~12 和 155~179)
+    mask_hsv_red = cv2.inRange(hsv, np.array([0, sat_min, val_min]), np.array([15, 255, 255]))
+    mask_hsv_red2 = cv2.inRange(hsv, np.array([155, sat_min, val_min]), np.array([179, 255, 255]))
+    hsv_mask = cv2.bitwise_or(mask_hsv_red, mask_hsv_red2)
+
+    if tint_type == "yellow":
+        # ------------------------------------------------------
+        # 分支 A：偏黄场景专属补偿机制
+        # ------------------------------------------------------
+        # 1. 扩展橙黄色 Hue 区间 (H: 13~28)
+        mask_orange_yellow = cv2.inRange(
+            hsv, np.array([13, min(255, sat_min + 15), val_min]), np.array([50, 255, 255])
+        )
+        hsv_mask = cv2.bitwise_or(hsv_mask, mask_orange_yellow)
+
+        # 2. 强效 R-G 显著性算子 (变黄的红线 R 依然显著高于 G，但黄色背景 R 接近 G)
+        rg_diff = r_ch.astype(np.int16) - g_ch.astype(np.int16)
+        salience_mask = np.zeros_like(r_ch)
+        salience_mask[rg_diff > 10] = 255
+
+    elif tint_type == "blue":
+        # ------------------------------------------------------
+        # 分支 B：偏蓝场景专属补偿机制
+        # ------------------------------------------------------
+        # 1. 扩展紫红/粉红 Hue 区间 (H: 140~154)
+        mask_purple_red = cv2.inRange(
+            hsv, np.array([140, sat_min, val_min]), np.array([154, 255, 255])
+        )
+        hsv_mask = cv2.bitwise_or(hsv_mask, mask_purple_red)
+
+        # 2. 强效 R-B 显著性算子 (偏蓝环境下，被压制的红线 R 依然要大于 B)
+        rb_diff = r_ch.astype(np.int16) - b_ch.astype(np.int16)
+        salience_mask = np.zeros_like(r_ch)
+        salience_mask[rb_diff > 15] = 255
+
+    else:
+        # ------------------------------------------------------
+        # 分支 C：常规场景
+        # ------------------------------------------------------
+        rg_diff = r_ch.astype(np.int16) - (g_ch.astype(np.int16) + b_ch.astype(np.int16)) / 2
+        salience_mask = np.zeros_like(r_ch)
+        salience_mask[rg_diff > 20] = 255
+
+    # CIE Lab 空间中的 a* 通道 (> 134 偏红/偏橙，抗光照能力强)
+    lab_salience = np.zeros_like(a)
+    lab_salience[a > 134] = 255
+
+    # 合并显著性区域
+    color_salience = cv2.bitwise_or(salience_mask, lab_salience)
+
+    # 掩膜求交集（HSV 空间 ∩ 显著性空间，确保不误杀且不误吸）
+    mask = cv2.bitwise_and(hsv_mask, color_salience)
+
+    # ==========================================================
+    # 5. 形态学闭运算粘合
+    # ==========================================================
+    kernel = np.ones((5, 25), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    kernel2 = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel2)
+
+    return mask
+
+
+def _horizontal_gradient_score(
+    roi_gray: np.ndarray,
+    mask: np.ndarray,
+    x: int, y: int, w: int, h: int,
+) -> float:
+    """
+    新增：水平梯度结构评分 + 红线连续性评分
+
+    工业油位表红色参考线具有明确的结构特征：
+      - 上下边缘有明显的水平梯度（Sobel dy=1 响应强）
+      - 在颜色 mask 中横向连续，中间断裂少
+
+    本函数综合两个指标，返回 0~100 的结构评分。
+
+    计算步骤：
+      1. Sobel Y方向梯度：提取候选区域灰度 patch，计算 dy=1 梯度幅值均值
+         → 反映水平边缘强度（红线上下边界）
+      2. 红线连续性：使用已有颜色 mask（非灰度 Otsu），统计候选区域内
+         每行 mask 前景像素占比，取平均值
+         → 反映红线是否连续完整（避免白色反光/黄色污渍干扰）
+
+    参数:
+        roi_gray: ROI 的灰度图
+        mask:     红线颜色检测的二值 mask（与连通域分析使用同一张）
+        x, y, w, h: 候选框的 bbox（ROI 内坐标）
+    返回:
+        0~100 的浮点评分（梯度 0~50 + 连续性 0~50）
+    """
+    # 边界安全裁剪
+    roi_h, roi_w = roi_gray.shape[:2]
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(roi_w, x + w)
+    y2 = min(roi_h, y + h)
+    patch_gray = roi_gray[y1:y2, x1:x2]
+    patch_mask = mask[y1:y2, x1:x2]
+    if patch_gray.size == 0:
+        return 0.0
+
+    # --- 指标 1：水平梯度强度 ---
+    # Sobel dy=1 检测水平边缘（红线上下边界）
+    grad_y = np.abs(cv2.Sobel(patch_gray, cv2.CV_32F, 0, 1, ksize=3))
+    # 均值归一化到 0~50
+    gradient_score = min(float(np.mean(grad_y)) / 4.0, 50.0)
+
+    # --- 指标 2：红线连续性（基于颜色 mask）---
+    # 使用已有红线 mask 的前景像素比例，而非灰度 Otsu
+    # 避免白色反光、黄色污渍、标签等非红色区域被误判为连续
+    row_ratios = np.mean(patch_mask > 0, axis=1)
+    max_row_ratio = np.max(row_ratios)
+    continuity_score = (np.mean(row_ratios) * 30 + max_row_ratio * 20)
+
+    return gradient_score + continuity_score
+
+
+def _detect_redlines_with_yolo(
+    model: YOLO,
+    roi: np.ndarray,
+    options: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    使用 YOLO 红线检测模型在 ROI 内检测红色参考线。
+
+    工作原理：
+      - 将 ROI 区域输入红线检测 YOLO 模型
+      - 获取所有红线检测框，取每个检测框的 y 坐标中值作为红线位置
+      - 按 y 中值升序排列，返回最上方和最下方的两条红线
+      - 返回格式与 _find_reference_lines 一致（[{"center_y": float}, ...]）
+
+    参数:
+        model:   已加载的红线检测 YOLO 模型实例
+        roi:     油位表区域的小图（BGR 格式）
+        options: 算法参数字典
+            - redline_det_conf: 红线检测置信度阈值（默认 0.25）
+            - redline_det_iou:  红线检测 NMS IoU 阈值（默认 0.45）
+
+    返回:
+        按 y 中值升序排列的红线列表 [{"center_y": float}, ...]
+        最多返回 2 条（最上和最下），不足 2 条时返回已有条目
+    """
+    conf = float(options.get("redline_det_conf", 0.25))
+    iou = float(options.get("redline_det_iou", 0.45))
+
+    results = model(roi, conf=conf, iou=iou, verbose=False)
+    if not results:
+        return []
+
+    boxes = getattr(results[0], "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    # 提取所有检测框的 y 坐标中值
+    detections = []
+    for box in boxes:
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        median_y = (y1 + y2) / 2.0  # 取 bbox 的 y 坐标中值
+        detections.append({"center_y": float(median_y)})
+
+    if len(detections) == 0:
+        return []
+
+    # 按 center_y 升序排列
+    detections.sort(key=lambda d: d["center_y"])
+
+    if len(detections) >= 2:
+        # 取最上方（y 最小）和最下方（y 最大）的两条红线
+        return [detections[0], detections[-1]]
+    else:
+        return detections
+
+
 def _find_reference_lines(
     roi: np.ndarray,
     tube: dict[str, int],
     options: dict[str, Any]
 ) -> list[dict[str, Any]]:
     """
-    工业油位表红色参考线检测（带曝光判断的双分支版本）
+    工业油位表红色参考线检测（带曝光判断的双分支 + fallback 版本）
 
     逻辑：
         检测 ROI 的曝光程度：
-        - 曝光严重 (True)  -> 运行增强版算法（CLAHE + RGB差值 + 粗内核膨胀）
         - 光照正常 (False) -> 运行原版算法（低开销 + 标准 HSV 色彩分割）
+                              若 candidates < 2，自动 fallback 到增强算法
+        - 曝光严重 (True)  -> 直接运行增强版算法（Gamma + CLAHE + RGB差值）
     """
     roi_h, roi_w = roi.shape[:2]
 
@@ -544,36 +857,8 @@ def _find_reference_lines(
     # 分支二：严重曝光（增强版算法）
     # ----------------------------------------------------------
     else:
-        # 1. 光照增强 CLAHE
-        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        l = clahe.apply(l)
-        enhanced = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-
-        # 2. HSV 红色检测（强光降阈值）
-        hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
-        sat_min = int(options.get("red_saturation_min", 35))
-        val_min = int(options.get("red_value_min", 50))
-
-        mask_hsv1 = cv2.inRange(hsv, np.array([0, sat_min, val_min]), np.array([12, 255, 255]))
-        mask_hsv2 = cv2.inRange(hsv, np.array([160, sat_min, val_min]), np.array([179, 255, 255]))
-        hsv_mask = cv2.bitwise_or(mask_hsv1, mask_hsv2)
-
-        # 3. RGB 红色差增强
-        b_channel, g_channel, r_channel = cv2.split(enhanced)
-        red_score = r_channel.astype(np.int16) - (g_channel.astype(np.int16) + b_channel.astype(np.int16)) / 2
-        rgb_mask = np.zeros_like(r_channel)
-        rgb_mask[red_score > 20] = 255
-
-        # 4. 融合 HSV + RGB
-        mask = cv2.bitwise_or(hsv_mask, rgb_mask)
-
-        # 5. 横向扩展形态学抗断裂
-        kernel = np.ones((5, 25), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-        kernel2 = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel2)
+        # 新增：Gamma曝光补偿
+        mask = _find_reference_lines_enhanced(roi, options)
 
 
     # ==========================================================
@@ -591,6 +876,9 @@ def _find_reference_lines(
     # ==========================================================
     # 公共步骤：连通域分析 + 几何筛选 + 评分去重
     # ==========================================================
+    # 新增：水平梯度评分需要灰度图（仅计算一次）
+    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
     candidates = []
 
@@ -626,16 +914,62 @@ def _find_reference_lines(
         if x + w > tube_left + side_margin:
             continue
 
+        # 修改：红线综合评分 = 面积 + 宽高比 + 水平梯度结构
+        grad_score = _horizontal_gradient_score(roi_gray, mask, x, y, w, h)
+        score = float(area) * 0.25 + float(aspect) * 20.0 + grad_score * 3.0
+
         candidates.append({
             "bbox": [int(x), int(y), int(w), int(h)],
             "center_x": float(center_x),
             "center_y": float(center_y),
             "area": int(area),
             "aspect": float(aspect),
-            "score": float(area) * 0.5 + float(aspect) * 20.0
+            "score": score
         })
 
-    if len(candidates) < 2:
+    # 新增：普通检测失败后的增强fallback
+    # 如果当前走的是正常曝光分支，但候选不足，自动用增强算法重试
+    if len(candidates) < 2 and not is_overexposed:
+        mask_enhanced = _find_reference_lines_enhanced(roi, options)
+        # 应用相同的区域限制
+        roi_mask = np.zeros_like(mask_enhanced)
+        roi_mask[:, :x_limit] = 255
+        mask_enhanced = cv2.bitwise_and(mask_enhanced, roi_mask)
+
+        count2, labels2, stats2, centroids2 = cv2.connectedComponentsWithStats(mask_enhanced, 8)
+        candidates = []
+        for i in range(1, count2):
+            x, y, w, h, area = stats2[i]
+            if area < min_area or w < min_width:
+                continue
+            aspect = w / max(h, 1)
+            if aspect < 2.0:
+                continue
+            center_x = x + w / 2.0
+            center_y = y + h / 2.0
+            if not (roi_h * min_y_ratio <= center_y <= roi_h * max_y_ratio):
+                continue
+            if x < 2:
+                continue
+            if x + w > tube_left + side_margin:
+                continue
+            # 修改：红线综合评分 = 面积 + 宽高比 + 水平梯度结构
+            grad_score = _horizontal_gradient_score(roi_gray, mask_enhanced, x, y, w, h)
+            score = float(area) * 0.2 + float(aspect) * 20.0 + grad_score * 3.5
+
+            candidates.append({
+                "bbox": [int(x), int(y), int(w), int(h)],
+                "center_x": float(center_x),
+                "center_y": float(center_y),
+                "area": int(area),
+                "aspect": float(aspect),
+                "score": score
+            })
+
+        if len(candidates) < 2:
+            return []
+
+    elif len(candidates) < 2:
         return []
 
     # 按综合评分降序排列

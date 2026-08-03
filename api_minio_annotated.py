@@ -58,7 +58,8 @@ MINIO_OUTPUT_PREFIX = os.getenv("MINIO_OUTPUT_PREFIX", "afterDetected")
 MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() in {"1", "true", "yes"}
 
 # YOLO 模型权重文件路径（相对于本文件所在目录）
-MODEL_PATH = Path(__file__).resolve().parent / "weights" / "best.pt"
+MODEL_PATH = Path(__file__).resolve().parent / "weights" / "level_best.pt"
+REDLINE_MODEL_PATH = Path(__file__).resolve().parent / "weights" / "red_best.pt"
 
 
 # ===========================================================================
@@ -142,6 +143,7 @@ minio_client = Minio(
 # 注意：这会在服务启动时就加载模型到内存，首次请求无需等待模型加载
 detector = OilLevelGaugeDetector(MODEL_PATH, defaults=DEFAULT_OPTIONS)
 detector.load()
+detector.load_redline_model(REDLINE_MODEL_PATH)
 
 
 # ===========================================================================
@@ -156,7 +158,7 @@ def health() -> dict[str, Any]:
     返回:
         {"status": "ok", "model_loaded": true/false}
     """
-    return {"status": "ok", "model_loaded": detector.loaded}
+    return {"status": "ok", "model_loaded": detector.loaded, "redline_model_loaded": detector._redline_loaded}
 
 
 @app.post("/detect/minio")
@@ -284,6 +286,7 @@ def _detect_one(object_key: str, options: dict[str, Any]) -> dict[str, Any]:
         "oil_level_position_ratio": result["oil_level_position_ratio"],
         "oil_level_score": result["oil_level_score"],
         "cost_ms": result["cost_ms"],
+        "redline_method": result.get("redline_method", "N/A"),
         "result_img_objectKey": result_key,
         "result_img_objectUrl": result_url,
     }
